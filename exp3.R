@@ -4,8 +4,12 @@
 
 args = commandArgs( trailingOnly = TRUE )
 
-INPUT_DIR <- args[ 1 ]
-EXP_FILE <- args[ 2 ]
+#INPUT_DIR <- args[ 1 ]
+#EXP_FILE <- args[ 2 ]
+NUM_FILES <- as.numeric(args[ 3 ])
+INPUT_DIR <- "Good_Files"
+EXP_FILE <- "exp.csv"
+
 SCRIPT_NAME <- "exp3.R"
 OUTPUT_DIR <- "out"
 FOLDER_FORMAT <- "(?:January|Febuary|March|April|May|June|July|August|September|October|November|December)_[0-9]{1,2}(_[0-9]{1,2}(AM|PM))?"
@@ -67,11 +71,11 @@ read_exp <- function(){
 
 	}
 
-	raw <- read.csv(EXP_FILE,header=T,skip=1,na.strings="na")
-	raw <- raw[,1:3] # date, time, pot#
+	raw <- read.csv( EXP_FILE,na.strings=c( "na","nan" ) )
 	posix <- apply( raw, 1, function( x ){ check_format(x[1:2]) } )
-	measurements <- data.table( unlist(posix),raw[,3] )
-	setnames(measurements,c("V1","V2"),c("Time","Pot"))
+	measurements <- data.table( unlist(posix),raw[,3], raw[,5], raw[,9] )
+	setnames(measurements,c("V1","V2","V3","V4"),c("Measurement_Time","Pot","Avg_Temp","Avg_Depth"))
+  	setkey(measurements,Measurement_Time)
 
 	return(measurements)
 }
@@ -96,70 +100,102 @@ proper_file <- function( file ){
 	file.split <- strsplit( file,"-" )
 	datetime <- paste0( file.split[[1]][2],file.split[[1]][3] )
 
-	return ( !is.na( strptime( datetime, format=DATE_FORMAT3 ) ) )
+	str <- strptime( datetime, format=DATE_FORMAT3 )
+	return ( as.POSIXct(str) )
 
 }
 
 get_filenames <- function(){
 	
-	all <- lapply(list.files(INPUT_DIR, FOLDER_FORMAT),
-		function(f){
-			ifelse(proper_folder(f),
-				paste0(INPUT_DIR,SEP,f),
+	folders <- list.files( INPUT_DIR, FOLDER_FORMAT )
+	all <- lapply( list.files( INPUT_DIR, FOLDER_FORMAT ),
+		function( f ){
+
+			ifelse( proper_folder( f ),
+				paste0( INPUT_DIR,SEP,f ),
 				NA)
+
 			})
-	names <- unlist(all)
-	for (i in seq(1:length(all))){
+	names <- unlist( all )
+	sorting <- vector()
+	for ( i in seq( 1:length( all ) ) ){
 
-		f <- list.files(all[[i]],FILE_FORMAT)
+		f <- list.files( all[[i]],FILE_FORMAT )
 
-		for (j in seq(1:length(f))){
+		for ( j in seq( 1:length( f ) ) ){
 
-			all[[i]][j] <- ifelse(proper_file(f[j]),paste0(names[i],"/",f[j]),NA)
+			proper <- proper_file( f[j] )
+			all[[i]][j] <- ifelse( !is.na( proper ),paste0( names[i],SEP,f[j] ),NA )
+			sorting <- c( sorting,proper ) 
 
 		}
 	}
-	return( unlist( all ) ) 
+
+	all <- unlist( all )
+	all <- all[order( sorting )]
+	return( all ) 
 }
 
 my_list <- function( l ){ vector("list",l) }
 
-read_files <- function( filenames, raw, exp ){
+read_files <- function( filenames, raw, exp_data ){
 
-	read_file <- function( fn ){
+	table_list <- my_list( length( filenames ) )
+	for ( i in 1:length( filenames ) ) {
 
-		f <- as.data.table(read.table(fn,header=T))
-		f <- f[,c( "EPOCH_TIME","N2O","CO2","CH4","H2O","NH3" ),with=F]
-		f$filename <- fn
+		d <- as.data.table( read.table( filenames[i],header=T ) ) 
+		rows <- nrow( d )
+		d <- d[,c( "EPOCH_TIME","N2O_dry","N2O_dry30s","CO2_dry","CH4_dry","H2O","NH3" ),with=F]
 
-		return( f )
+		raw <- rbindlist( list( raw,d ) )
+		table_list[[i]] <- exp_data[rep( c( i ),each=rows ),]
+
 	}
 
-	for ( fn in filenames ){
+	to_merge <- rbindlist( table_list )
+	raw <- raw[,c( "Measurement_Time","Pot","Avg_Temp","Avg_Depth" ):=to_merge]
 
-		raw <- rbindlist( list(raw, read_file( fn ) ) )
-	}
+	return( raw )	
 
-	setkey(raw,EPOCH_TIME)	
-
-	return( raw )
 }
 
-quality_control <- function( d, exp ){
+#---------------------------------------------------------
+# correct_time
+# Get times for a measurement w/ start time at zero.
+# Arguments: d -- data frame containing data from one measurement.
+# Returns: -- all times minus start time.
+#
+correct_time <- function( d ){ d$EPOCH_TIME - d$EPOCH_TIME[ 1 ] }
+
+
+quality_control <- function( d ){
+
+	t <- as.numeric(correct_time(d))
+	mods <- my_list(6)
 	
-	
+	for ( i in 2:7 ){
+
+		mods[[i-1]] <- d[[i]]	
+		
+	}
+
+	mods <- lapply(mods, function( x ){ lm( as.numeric(x) ~ t,na.action="na.exclude" ) } )
+	p <- lapply(mods,function( x ){ summary( x )$coefficients[2,4] } )
+	r2 <- lapply(mods,function( x ){ round( summary( x )$r.squared, 2 ) } )
+
+	return(c(unlist(r2),unlist(p)))	
 
 }
 
 
 # --------------------------------------------------------------------------------
 # main
-main <- function() {
+#main <- function() {
 
 	stopifnot( file.exists( INPUT_DIR ) )
 	stopifnot( file.exists( EXP_FILE ) )
 
-	loadlibs(c("data.table"))
+	loadlibs(c("data.table","plyr") )
 
 	if( !file.exists( OUTPUT_DIR ) ) {
 
@@ -167,14 +203,17 @@ main <- function() {
   		dir.create( OUTPUT_DIR )
 
 	}
-	exp_data <- read_exp()
-	raw <- data.table()
+  	exp_data <- read_exp()
+	files <- get_filenames()
 
-	print(exp_data)
+	raw <- read_files( files, data.table(), exp_data )
+	
+	names_r2 <- c("N2O_dry_r2","N2O_dry30s_r2","CO2_dry_r2","CH4_dry_r2","H2O_r2","NH3_r2")
+	names_p <- c("N2O_dry_p","N2O_dry30s_p","CO2_dry_p","CH4_dry_p","H2O_p","NH3_p")
+	names <- c(names_r2,names_p)
 
-	raw <- read_files( get_filenames(), raw )
-	qc <- raw[,quality_control( .SD, exp_data ),by=Filename,.SDcols=colnames(raw)]
-}
+	qc <- ddply(raw,.(Measurement_Time),.fun=quality_control)
+  setnames(qc,c("Measurement_Time",paste0("V",as.character(1:12))),c("Measurement_Time",names))
 
-main()
+#main()
 
