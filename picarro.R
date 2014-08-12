@@ -10,7 +10,7 @@ NUM_FILES <- as.numeric(args[ 3 ])
 INPUT_DIR <- "Good_Files"
 EXP_FILE <- "exp.csv"
 
-SCRIPT_NAME <- "exp3.R"
+SCRIPT_NAME <- "picarro.R"
 OUTPUT_DIR <- "out"
 FOLDER_FORMAT <- "(?:January|Febuary|March|April|May|June|July|August|September|October|November|December)_[0-9]{1,2}(_[0-9]{1,2}(AM|PM))?"
 FILE_FORMAT <- "JFAADS2012-20[0-9]{6}-\\d+-DataLog_User"
@@ -28,8 +28,9 @@ DATE_FORMAT5 <- "%m_%d_%y %H:%M"
 #                ts  -- Time stamp? Default = TRUE
 #                cr  -- New line? Default = TRUE
 #
-printlog <- function( msg="", ..., ts=TRUE, cr=TRUE ) {
+printlog <- function( msg="", ..., ts=TRUE, cr=TRUE, pre_cr=FALSE ) {
 
+  if ( pre_cr ) cat( "\n" )
   if( ts ) cat( date(), " " )
   cat( msg, ... )
   if( cr ) cat( "\n")
@@ -139,9 +140,12 @@ get_filenames <- function(){
 my_list <- function( l ){ vector("list",l) }
 
 read_files <- function( filenames, raw, exp_data ){
+  pb <- txtProgressBar(min = 0, max = length(filenames), style = 3)
 
 	table_list <- my_list( length( filenames ) )
 	for ( i in 1:length( filenames ) ) {
+	  # update progress bar
+	  setTxtProgressBar(pb, i)
 
 		d <- as.data.table( read.table( filenames[i],header=T ) ) 
 		rows <- nrow( d )
@@ -187,6 +191,35 @@ quality_control <- function( d ){
 
 }
 
+calc <- function( resp, depth, temp ){
+  
+    return(depth * temp)
+  
+}
+
+compute_flux <- function( raw ){
+
+	time <- correct_time( raw )
+  depth <- raw$Avg_Depth[1]
+  temp <- raw$Avg_Temp[1]
+  pot <- raw$Pot[1]
+  raw <- as.data.table(raw)
+
+	respirations <- apply(raw[,2:7,with=F], 2, function(x){ as.numeric( coef( lm( x ~ time) )[ 2 ] ) })
+  
+  fluxes <- sapply(respirations, calc, depth, temp, simplify=T)
+	
+	return( fluxes )
+	
+}
+
+get_alldata <- function(raw, qc){
+
+	fluxes <- ddply( raw, .( Measurement_Time ), .fun=compute_flux )
+  return( as.data.table( merge( fluxes, qc,by=c( "Measurement_Time" ) ) ) )
+  
+}
+
 
 # --------------------------------------------------------------------------------
 # main
@@ -203,7 +236,8 @@ quality_control <- function( d ){
   		dir.create( OUTPUT_DIR )
 
 	}
-  	exp_data <- read_exp()
+  printlog("Reading data.")
+  exp_data <- read_exp()
 	files <- get_filenames()
 
 	raw <- read_files( files, data.table(), exp_data )
@@ -212,8 +246,14 @@ quality_control <- function( d ){
 	names_p <- c("N2O_dry_p","N2O_dry30s_p","CO2_dry_p","CH4_dry_p","H2O_p","NH3_p")
 	names <- c(names_r2,names_p)
 
+  printlog("Running quality control.",pre_cr=T)
 	qc <- ddply(raw,.(Measurement_Time),.fun=quality_control)
   setnames(qc,c("Measurement_Time",paste0("V",as.character(1:12))),c("Measurement_Time",names))
+
+  printlog("Computing fluxes, combining with qc.")
+  alldata <- get_alldata(raw, qc)
+
+  printlog("All done with ", SCRIPT_NAME)
 
 #main()
 
