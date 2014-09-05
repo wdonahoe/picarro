@@ -6,7 +6,7 @@ import os
 import sys
 # TODO: Add Windows functionality.
 
-SCRIPT_NAME = "exp3.R"
+SCRIPT_NAME = "picarro.R"
 
 
 class ScriptException(Exception):

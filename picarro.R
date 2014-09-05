@@ -21,6 +21,12 @@ DATE_FORMAT3 <- "%Y%m%d%H%M%S"
 DATE_FORMAT4 <- "%m_%d_%Y %H:%M"
 DATE_FORMAT5 <- "%m_%d_%y %H:%M"
 
+CHAMBER_RAD <- 21.5 # cm
+
+# TODO: Get actual volume.
+PICARRO_V <- 482 # cm3 or sccm
+LICOR_V <- 263 # cm3
+
 # -----------------------------------------------------------------------------
 # printlog
 # Time-stamped output function
@@ -58,6 +64,27 @@ loadlibs <- function( liblist ) {
   invisible( loadedlibs )
 
 } # loadlibs
+
+# ----------------------------------------------------------
+# savedata
+# Save a data frame
+# Arguments: df -- A data frame to save.
+# extension -- file extension. Default = .csv
+savedata <- function( d, extension=".csv" ) {
+	
+	my.write <- function(x, file, header, f = write.csv, ...){
+		datafile <- file(file, open='wt')
+		on.exit(close(datafile))
+		if (!missing(header)) writeLines(header,con=datafile)
+		return( f(x, datafile, ...) )
+	}
+
+  	stopifnot( file.exists( OUTPUT_DIR ) )
+  	fn <- paste0( OUTPUT_DIR, SEP, format( Sys.time(),"%d%B%Y_%H%M%S" ),"_fluxes",extension )
+  	printlog( "Saving", fn )
+  	my.write( d, fn, f = write.csv, row.names=FALSE )
+
+} # savedata
 
 read_exp <- function(){
 
@@ -117,6 +144,7 @@ get_filenames <- function(){
 				NA)
 
 			})
+
 	names <- unlist( all )
 	sorting <- vector()
 	for ( i in seq( 1:length( all ) ) ){
@@ -140,12 +168,14 @@ get_filenames <- function(){
 my_list <- function( l ){ vector("list",l) }
 
 read_files <- function( filenames, raw, exp_data ){
-  pb <- txtProgressBar(min = 0, max = length(filenames), style = 3)
+
+  	pb <- txtProgressBar(min = 0, max = length(filenames), style = 3)
 
 	table_list <- my_list( length( filenames ) )
 	for ( i in 1:length( filenames ) ) {
-	  # update progress bar
-	  setTxtProgressBar(pb, i)
+
+	  	# update progress bar
+	  	setTxtProgressBar(pb, i)
 
 		d <- as.data.table( read.table( filenames[i],header=T ) ) 
 		rows <- nrow( d )
@@ -193,30 +223,60 @@ quality_control <- function( d ){
 
 calc <- function( resp, depth, temp ){
   
-    return(depth * temp)
+	# We want to convert raw respiration (d[CO2]/dt) to a flux using
+  	# A = dC/dt * V/S * Pa/RT (e.g. Steduto et al. 2002), where
+  	# A is CO2 flux (umol/m2/s)
+  	# dC/dt is raw respiration as above (mole fraction/s)
+  	# V is total chamber volume (m3)
+  	# ...we are correcting for varying headspaces in the cores
+  	# S is ground surface area (m2)
+  	# ...but we're computing per kg of soil, so using dry mass instead
+  	# Pa is atmospheric pressure (kPa)
+  	# R is universal gas constant (8.3 x 10-3 m-3 kPa mol-1 K-1)
+  	# T is air temperature (K)
+
+	# TODO: Flux Equation.
+
+	S <- pi * CHAMBER_RAD ^ 2
+	chamber_v <- depth * S
+	V <- chamber_v + PICARRO_V + LICOR_V
+	Pa <- 101 #kPA
+	R <- 8.3145e-3 # m-3 kPa mol-1 K-1
+  	Kelvin <- 273.15 # C to K conversion
+	Temp <- temp + Kelvin
+
+	flux <- resp * ( V / S ) * Pa / ( R * Temp )
+
+    return( flux )
   
 }
 
 compute_flux <- function( raw ){
 
 	time <- correct_time( raw )
-  depth <- raw$Avg_Depth[1]
-  temp <- raw$Avg_Temp[1]
-  pot <- raw$Pot[1]
-  raw <- as.data.table(raw)
-
-	respirations <- apply(raw[,2:7,with=F], 2, function(x){ as.numeric( coef( lm( x ~ time) )[ 2 ] ) })
-  
-  fluxes <- sapply(respirations, calc, depth, temp, simplify=T)
+  	depth <- raw$Avg_Depth[1]
+  	temp <- raw$Avg_Temp[1]
+  	pot <- raw$Pot[1]
+  	raw <- as.data.table(raw)
 	
-	return( fluxes )
+	respirations <- apply(raw[,2:7,with=F], 2, function(x){ as.numeric( coef( lm( x ~ time ) )[ 2 ] ) })
+  
+  	fluxes <- sapply(respirations, calc, depth, temp, simplify=T)
+	fluxes[4] <- fluxes[4] * 1.0e-3 # umol -> nmol
+	ret <- c(fluxes,temp)
+
+	names( ret ) <-  c( "N2O_dry_flux [umol m-2 s-1]","N2O_dry30s_flux [umol m-2 s-1]",
+				"CO2_dry_flux [umol m-2 s-1]","CH4_dry_flux [nmol m-2 s-1]",
+				"H2O_flux [umol m-2 s-1]","NH3_flux [umol m-2 s-1]", "Temp [C]")
+	
+	return( ret )
 	
 }
 
 get_alldata <- function(raw, qc){
 
 	fluxes <- ddply( raw, .( Measurement_Time ), .fun=compute_flux )
-  return( as.data.table( merge( fluxes, qc,by=c( "Measurement_Time" ) ) ) )
+  	return( as.data.table( merge( fluxes, qc,by=c( "Measurement_Time" ) ) ) )
   
 }
 
@@ -236,8 +296,9 @@ get_alldata <- function(raw, qc){
   		dir.create( OUTPUT_DIR )
 
 	}
-  printlog("Reading data.")
-  exp_data <- read_exp()
+
+  	printlog("Reading data.")
+  	exp_data <- read_exp()
 	files <- get_filenames()
 
 	raw <- read_files( files, data.table(), exp_data )
@@ -246,14 +307,15 @@ get_alldata <- function(raw, qc){
 	names_p <- c("N2O_dry_p","N2O_dry30s_p","CO2_dry_p","CH4_dry_p","H2O_p","NH3_p")
 	names <- c(names_r2,names_p)
 
-  printlog("Running quality control.",pre_cr=T)
-	qc <- ddply(raw,.(Measurement_Time),.fun=quality_control)
-  setnames(qc,c("Measurement_Time",paste0("V",as.character(1:12))),c("Measurement_Time",names))
+  	printlog("Running quality control.",pre_cr=T)
+	  qc <- ddply(raw,.(Measurement_Time),.fun=quality_control)
+  	setnames(qc,c("Measurement_Time",paste0("V",as.character(1:12))),c("Measurement_Time",names))
 
-  printlog("Computing fluxes, combining with qc.")
-  alldata <- get_alldata(raw, qc)
+  	printlog("Computing fluxes, combining with qc.")
+  	alldata <- get_alldata(raw, qc)
 
-  printlog("All done with ", SCRIPT_NAME)
+  #	savedata( alldata )
+  	printlog("All done with ", SCRIPT_NAME)
 
 #main()
 
